@@ -20,6 +20,7 @@ from aiogram.types import (
     Message,
     ReplyKeyboardMarkup,
 )
+from aiohttp import web
 import yt_dlp
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
@@ -237,7 +238,6 @@ async def get_missing_channels(
             if status in {"left", "kicked"}:
                 missing.append((ch_id, chat_ref, title))
         except Exception:
-            # Agar bot kanalda admin bo'lmasa yoki chat topilmasa, xavfsizlik uchun ro'yxatga qo'shamiz
             missing.append((ch_id, chat_ref, title))
     return missing
 
@@ -632,12 +632,33 @@ async def handle_video(message: Message, bot: Bot) -> None:
             )
 
 
+# --- Render Web Service uchun HTTP port ---
+async def health_handler(request: web.Request) -> web.Response:
+    return web.Response(text="OK")
+
+
+async def start_web_server() -> web.AppRunner:
+    port = int(os.getenv("PORT", "8080"))
+    app = web.Application()
+    app.router.add_get("/", health_handler)
+    app.router.add_get("/health", health_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    return runner
+
+
 async def main() -> None:
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN muhit o'zgaruvchisi topilmadi.")
     init_db()
+    runner = await start_web_server()
     bot = Bot(token=BOT_TOKEN)
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await runner.cleanup()
 
 
 if __name__ == "__main__":
