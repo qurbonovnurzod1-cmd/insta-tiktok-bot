@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import re
 import sqlite3
@@ -43,6 +44,7 @@ class UserStates(StatesGroup):
 class AdminStates(StatesGroup):
     waiting_add_channel = State()
     waiting_reply_user = State()
+    waiting_broadcast_content = State()
 
 
 # --- Baza bilan ishlash ---
@@ -99,6 +101,12 @@ def upsert_user(user_id: int, username: str | None, full_name: str) -> None:
             (user_id, username, full_name, now, now),
         )
         conn.commit()
+
+
+def get_all_user_ids() -> list[int]:
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute("SELECT user_id FROM users").fetchall()
+    return [int(row[0]) for row in rows]
 
 
 def increment_downloads() -> None:
@@ -177,6 +185,11 @@ def admin_panel_kb() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
+                    text="📢 Reklama tarqatish", callback_data="adm:broadcast"
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     text="➕ Majburiy kanal qo'shish", callback_data="adm:add_ch"
                 )
             ],
@@ -190,6 +203,21 @@ def admin_panel_kb() -> InlineKeyboardMarkup:
                     text="📊 Statistika", callback_data="adm:stats"
                 )
             ],
+        ]
+    )
+
+
+def broadcast_confirm_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Yuborish", callback_data="adm:bc_confirm"
+                ),
+                InlineKeyboardButton(
+                    text="❌ Bekor qilish", callback_data="adm:bc_cancel"
+                ),
+            ]
         ]
     )
 
@@ -422,7 +450,149 @@ async def open_admin_panel(message: Message, state: FSMContext) -> None:
     if not user or user.id not in ADMIN_IDS:
         return
     await state.clear()
-    await message.answer("🛠 <b>Admin panel</b>", reply_markup=admin_panel_kb(), parse_mode="HTML")
+    await message.answer(
+        "🛠 <b>Admin panel</b>", reply_markup=admin_panel_kb(), parse_mode="HTML"
+    )
+
+
+# --- Reklama tarqatish (matn, rasm, video) ---
+@dp.callback_query(F.data == "adm:broadcast")
+async def cb_start_broadcast(callback: CallbackQuery, state: FSMContext) -> None:
+    user = callback.from_user
+    if not user or user.id not in ADMIN_IDS:
+        await callback.answer("Ruxsat yo‘q", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_broadcast_content)
+    await callback.message.answer(
+        "📢 Reklama tarqatish uchun <b>matn</b>, <b>rasm</b> yoki <b>video</b> "
+        "(xohlasangiz izohi bilan) yuboring.\n\n"
+        "Bekor qilish uchun /cancel bosing.",
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@dp.message(AdminStates.waiting_broadcast_content, F.text | F.photo | F.video)
+async def handle_broadcast_preview(message: Message, state: FSMContext) -> None:
+    user = message.from_user
+    if not user or user.id not in ADMIN_IDS:
+        return
+
+    users_count = len(get_all_user_ids())
+    await state.update_data(
+        bc_chat_id=message.chat.id,
+        bc_message_id=message.message_id,
+    )
+    await message.answer(
+        f"👆 Reklama xabari qabul qilindi.\n"
+        f"👥 Jami yuboriladi: <b>{users_count}</b> ta foydalanuvchiga.\n\n"
+        f"Tarqatishni boshlaysizmi?",
+        reply_markup=broadcast_confirm_kb(),
+        parse_mode="HTML",
+    )
+
+
+@dp.message(AdminStates.waiting_broadcast_content)
+async def handle_broadcast_invalid(message: Message) -> None:
+    user = message.from_user
+    if not user or user.id not in ADMIN_IDS:
+        return
+    await message.answer(
+        "⚠️ Reklama sifatida faqat <b>matn</b>, <b>rasm</b> yoki <b>video</b> yuboring "
+        "(yoki /cancel bosing).",
+        parse_mode="HTML",
+    )
+
+
+@dp.callback_query(F.data == "adm:bc_cancel")
+async def cb_cancel_broadcast(callback: CallbackQuery, state: FSMContext) -> None:
+    user = callback.from_user
+    if not user or user.id not in ADMIN_IDS:
+        await callback.answer("Ruxsat yo‘q", show_alert=True)
+        return
+    await state.clear()
+    try:
+        await callback.message.edit_text("❌ Reklama tarqatish bekor qilindi.")
+    except Exception:
+        await callback.message.answer("❌ Reklama tarqatish bekor qilindi.")
+    await callback.message.answer(
+        "🛠 <b>Admin panel</b>", reply_markup=admin_panel_kb(), parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "adm:bc_confirm")
+async def cb_confirm_broadcast(
+    callback: CallbackQuery, bot: Bot, state: FSMContext
+) -> None:
+    user = callback.from_user
+    if not user or user.id not in ADMIN_IDS:
+        await callback.answer("Ruxsat yo‘q", show_alert=True)
+        return
+
+    data = await state.get_data()
+    bc_chat_id = data.get("bc_chat_id")
+    bc_message_id = data.get("bc_message_id")
+    await state.clear()
+
+    if not bc_chat_id or not bc_message_id:
+        await callback.message.answer(
+            "⚠️ Reklama xabari topilmadi. Qaytadan urinib ko‘ring.",
+            reply_markup=admin_panel_kb(),
+        )
+        await callback.answer()
+        return
+
+    user_ids = get_all_user_ids()
+    total = len(user_ids)
+    sent = 0
+    failed = 0
+
+    await callback.answer("Reklama yuborish boshlandi...", show_alert=False)
+    progress_msg = await callback.message.answer(
+        f"⏳ Reklama yuborilmoqda... (0/{total})"
+    )
+
+    for idx, uid in enumerate(user_ids, start=1):
+        try:
+            await bot.copy_message(
+                chat_id=uid,
+                from_chat_id=bc_chat_id,
+                message_id=bc_message_id,
+            )
+            sent += 1
+        except Exception as exc:
+            logging.warning("Broadcast error for user %s: %s", uid, exc)
+            failed += 1
+
+        await asyncio.sleep(0.05)
+
+        if idx % 25 == 0 or idx == total:
+            try:
+                await progress_msg.edit_text(
+                    f"⏳ Reklama yuborilmoqda... ({idx}/{total})"
+                )
+            except Exception:
+                pass
+
+    try:
+        await progress_msg.edit_text(
+            f"✅ <b>Reklama tarqatish yakunlandi!</b>\n\n"
+            f"✉️ Yetkazildi: <b>{sent}</b> ta\n"
+            f"🚫 Yetkazilmadi: <b>{failed}</b> ta",
+            parse_mode="HTML",
+        )
+    except Exception:
+        await callback.message.answer(
+            f"✅ <b>Reklama tarqatish yakunlandi!</b>\n\n"
+            f"✉️ Yetkazildi: <b>{sent}</b> ta\n"
+            f"🚫 Yetkazilmadi: <b>{failed}</b> ta",
+            parse_mode="HTML",
+        )
+
+    await callback.message.answer(
+        "🛠 <b>Admin panel</b>", reply_markup=admin_panel_kb(), parse_mode="HTML"
+    )
 
 
 @dp.callback_query(F.data == "adm:stats")
